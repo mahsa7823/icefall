@@ -23,9 +23,14 @@ PRETRAINED_DIR=$ICEFALL_ROOT/egs/librispeech/ASR/icefall-asr-librispeech-pruned-
 EXP_DIR=pruned_transducer_stateless7_contextual/exp
 
 # ---- Do not edit below ----
-eval "$ENV_SETUP"
-export PYTHONPATH=$ICEFALL_ROOT:$PYTHONPATH
+set -eo pipefail
+eval "$ENV_SETUP" || { echo "ENV_SETUP failed: $ENV_SETUP"; exit 1; }
+export PYTHONPATH=$ICEFALL_ROOT:${PYTHONPATH:-}
 cd $ICEFALL_ROOT/egs/librispeech/ASR
-set -eou pipefail
+set -u
 echo "host: $(hostname)  date: $(date)  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
-python -c "import torch, k2; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), torch.cuda.device_count())"
+echo "python: $(command -v python)"
+python -c "import torch, k2; print('torch', torch.__version__, 'k2', k2.__file__, 'cuda', torch.cuda.is_available(), torch.cuda.device_count())" || {
+  echo "Cannot import torch/k2 with $(command -v python). Check ENV_SETUP in slurm/env.sh."
+  exit 1
+}
