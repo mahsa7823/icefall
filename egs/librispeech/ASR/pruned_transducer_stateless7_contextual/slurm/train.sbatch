@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+#SBATCH --job-name=ctx-train
+#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=128G
+#SBATCH --time=48:00:00
+#SBATCH --output=slurm-%x-%j.out
+#
+# Train the biasing modules on top of the frozen pretrained stateless7 model
+# (full LibriSpeech, 4 GPUs). Submit from the icefall root:
+#   sbatch egs/librispeech/ASR/pruned_transducer_stateless7_contextual/slurm/train.sbatch
+#
+# To resume, resubmit with START_EPOCH set to the next epoch, e.g.
+#   START_EPOCH=5 sbatch .../train.sbatch
+# (epoch-4.pt must exist in EXP_DIR). --init-asr-ckpt is only used when
+# START_EPOCH=1.
+
+ICEFALL_ROOT=${ICEFALL_ROOT:-$SLURM_SUBMIT_DIR}
+source $ICEFALL_ROOT/egs/librispeech/ASR/pruned_transducer_stateless7_contextual/slurm/env.sh
+
+START_EPOCH=${START_EPOCH:-1}
+NUM_EPOCHS=${NUM_EPOCHS:-10}
+MAX_DURATION=${MAX_DURATION:-1600}  # per GPU; lower it on OOM
+N_DISTRACTORS=${N_DISTRACTORS:-100}
+MASTER_PORT=${MASTER_PORT:-$((12000 + RANDOM % 1000))}
+
+mkdir -p $EXP_DIR
+python pruned_transducer_stateless7_contextual/train.py \
+  --world-size 4 \
+  --master-port $MASTER_PORT \
+  --use-fp16 true \
+  --full-libri true \
+  --max-duration $MAX_DURATION \
+  --exp-dir $EXP_DIR \
+  --bpe-model data/lang_bpe_500/bpe.model \
+  --init-asr-ckpt $PRETRAINED_DIR/exp/pretrained.pt \
+  --context-dir data/fbai-speech/is21_deep_bias \
+  --n-distractors $N_DISTRACTORS \
+  --start-epoch $START_EPOCH \
+  --num-epochs $NUM_EPOCHS \
+  --prune-range 5
+
+echo "Training done: $(date)"
