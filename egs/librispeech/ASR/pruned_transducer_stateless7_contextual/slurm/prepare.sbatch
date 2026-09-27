@@ -10,8 +10,9 @@
 #   sbatch egs/librispeech/ASR/pruned_transducer_stateless7_contextual/slurm/prepare.sbatch
 #
 # Steps (each is skipped if already done):
-#   1. link $LIBRISPEECH_DIR into download/, then prepare.sh stages 0-3:
-#      manifests, MUSAN (downloaded if missing), fbank (+speed perturbation)
+#   1. link $LIBRISPEECH_DIR into download/, then prepare.sh stages 0-4:
+#      manifests, MUSAN (downloaded if missing), LibriSpeech fbank
+#      (+speed perturbation) and MUSAN fbank
 #   2. pretrained stateless7 model + its bpe.model -> data/lang_bpe_500
 #   3. biasing word lists from facebookresearch/fbai-speech (is21_deep_bias)
 
@@ -25,7 +26,8 @@ mkdir -p download
 for part in train-clean-100 train-clean-360 train-other-500 dev-clean dev-other test-clean test-other; do
   [ -d download/LibriSpeech/$part ] || { echo "Missing $LIBRISPEECH_DIR/$part"; exit 1; }
 done
-./prepare.sh --stage 0 --stop-stage 3
+# Stage 4 = MUSAN fbank; stop before stage 5 (BPE): we use the pretrained bpe.model
+./prepare.sh --stage 0 --stop-stage 4
 
 # 2. Pretrained ASR model. Its bpe.model must be used for training/decoding.
 HF=https://huggingface.co/csukuangfj/icefall-asr-librispeech-pruned-transducer-stateless7-2022-11-11/resolve/main
