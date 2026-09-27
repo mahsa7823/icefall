@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=ctx-train
-#SBATCH --gres=gpu:4
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=128G
+##SBATCH --gres=gpu:4
+#SBATCH --gpus=2
+##SBATCH --nodes=4
+##SBATCH --cpus-per-task=16
+##SBATCH --mem=128G
 #SBATCH --time=48:00:00
 #SBATCH --output=slurm-%x-%j.out
+#SBATCH --partition=gpu-a100   #queue
+#SBATCH --account=a100acct
+
+
+module purge
+module load conda
+conda activate /export/fs04/a12/mahsay/miniconda3/envs/icefall
+
 #
 # Train the biasing modules on top of the frozen pretrained stateless7 model
 # (full LibriSpeech, 4 GPUs requested; uses however many are allocated). Submit from the icefall root:
