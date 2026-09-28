@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=ctx-decode
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+#SBATCH --gpus=1
+#SBATCH --partition=gpu-a100
+#SBATCH --account=a100acct
 #SBATCH --time=12:00:00
 #SBATCH --output=slurm-%x-%j.out
 #
