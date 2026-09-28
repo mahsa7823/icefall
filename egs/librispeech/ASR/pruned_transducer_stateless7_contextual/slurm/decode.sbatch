@@ -5,6 +5,12 @@
 #SBATCH --account=a100acct
 #SBATCH --time=12:00:00
 #SBATCH --output=slurm-%x-%j.out
+
+
+module purge
+module load conda
+conda activate /export/fs04/a12/mahsay/miniconda3/envs/icefall
+
 #
 # Decode test-clean/test-other with the predefined biasing lists of
 # facebookresearch/fbai-speech and report WER, U-WER (unbiased words) and
