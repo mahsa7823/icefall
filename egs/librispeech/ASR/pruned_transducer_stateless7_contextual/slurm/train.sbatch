@@ -28,6 +28,12 @@ conda activate /export/fs04/a12/mahsay/miniconda3/envs/icefall
 ICEFALL_ROOT=${ICEFALL_ROOT:-$SLURM_SUBMIT_DIR}
 source $ICEFALL_ROOT/egs/librispeech/ASR/pruned_transducer_stateless7_contextual/slurm/env.sh
 
+# Optional: EXP_NAME=foo uses $EXP_DIR-foo (one directory per experiment);
+# EXTRA_ARGS="--flag value ..." is passed on to the python script.
+[ -z "${EXP_NAME:-}" ] || EXP_DIR=$EXP_DIR-$EXP_NAME
+EXTRA_ARGS=${EXTRA_ARGS:-}
+echo "EXP_DIR=$EXP_DIR  EXTRA_ARGS=$EXTRA_ARGS"
+
 START_EPOCH=${START_EPOCH:-1}
 NUM_EPOCHS=${NUM_EPOCHS:-10}
 MAX_DURATION=${MAX_DURATION:-1600}  # per GPU; lower it on OOM
@@ -52,6 +58,7 @@ python pruned_transducer_stateless7_contextual/train.py \
   --n-distractors $N_DISTRACTORS \
   --start-epoch $START_EPOCH \
   --num-epochs $NUM_EPOCHS \
-  --prune-range 5
+  --prune-range 5 \
+  $EXTRA_ARGS
 
 echo "Training done: $(date)"

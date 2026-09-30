@@ -24,6 +24,12 @@ conda activate /export/fs04/a12/mahsay/miniconda3/envs/icefall
 ICEFALL_ROOT=${ICEFALL_ROOT:-$SLURM_SUBMIT_DIR}
 source $ICEFALL_ROOT/egs/librispeech/ASR/pruned_transducer_stateless7_contextual/slurm/env.sh
 
+# Optional: EXP_NAME=foo uses $EXP_DIR-foo (one directory per experiment);
+# EXTRA_ARGS="--flag value ..." is passed on to the python script.
+[ -z "${EXP_NAME:-}" ] || EXP_DIR=$EXP_DIR-$EXP_NAME
+EXTRA_ARGS=${EXTRA_ARGS:-}
+echo "EXP_DIR=$EXP_DIR  EXTRA_ARGS=$EXTRA_ARGS"
+
 EPOCH=${EPOCH:?set EPOCH, e.g. EPOCH=10}
 AVG=${AVG:-1}
 USE_AVG_MODEL=${USE_AVG_MODEL:-true}  # needs epoch-$((EPOCH-AVG)).pt when true
@@ -44,7 +50,7 @@ decode() {
     --decoding-method modified_beam_search \
     --beam-size 4 \
     --max-duration 600 \
-    "$@" 2>&1 | tee -a $RESULTS
+    $EXTRA_ARGS "$@" 2>&1 | tee -a $RESULTS
 }
 
 # Baseline: same checkpoint, all biasing off
