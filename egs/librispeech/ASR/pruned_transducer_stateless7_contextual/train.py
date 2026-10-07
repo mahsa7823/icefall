@@ -18,40 +18,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
+Train the neural biasing modules on top of a frozen, pretrained
+pruned_transducer_stateless7 model. See ./README.md for data preparation.
+
 Usage:
 
 export CUDA_VISIBLE_DEVICES="0,1,2,3"
 
-./pruned_transducer_stateless7/train.py \
-  --world-size 4 \
-  --num-epochs 30 \
-  --start-epoch 1 \
-  --exp-dir pruned_transducer_stateless7/exp \
-  --full-libri 1 \
-  --max-duration 300
-
-# For mix precision training:
-
-./pruned_transducer_stateless7/train.py \
+./pruned_transducer_stateless7_contextual/train.py \
   --world-size 4 \
   --num-epochs 30 \
   --start-epoch 1 \
   --use-fp16 1 \
-  --exp-dir pruned_transducer_stateless7/exp \
   --full-libri 1 \
-  --max-duration 550
-
+  --max-duration 1600 \
+  --exp-dir pruned_transducer_stateless7_contextual/exp \
+  --bpe-model data/lang_bpe_500/bpe.model \
+  --init-asr-ckpt icefall-asr-librispeech-pruned-transducer-stateless7-2022-11-11/exp/pretrained.pt \
+  --context-dir data/fbai-speech/is21_deep_bias \
+  --n-distractors 100
 """
 
 
 import argparse
 import copy
+import itertools
 import logging
 import warnings
 from pathlib import Path
 from shutil import copyfile
 from typing import Any, Dict, Optional, Tuple, Union
-import itertools
 
 import k2
 import optim
@@ -60,6 +56,11 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
 from asr_datamodule import LibriSpeechAsrDataModule
+from biasing_module import BiasingModule
+from context_collector import ContextCollector
+from context_encoder_lstm import ContextEncoderLSTM
+from context_encoder_pretrained import ContextEncoderPretrained
+from context_encoder_reused import ContextEncoderReused
 from decoder import Decoder
 from joiner import Joiner
 from lhotse.cut import Cut
@@ -72,12 +73,6 @@ from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from zipformer import Zipformer
-from context_encoder import ContextEncoder
-from context_encoder_lstm import ContextEncoderLSTM
-from context_encoder_pretrained import ContextEncoderPretrained
-from context_encoder_reused import ContextEncoderReused
-from biasing_module import BiasingModule
-from context_collector import ContextCollector
 
 from icefall import diagnostics
 from icefall.checkpoint import load_checkpoint, remove_checkpoints
@@ -110,6 +105,47 @@ def set_batch_count(model: Union[nn.Module, DDP], batch_count: float) -> None:
 
 
 def add_model_arguments(parser: argparse.ArgumentParser):
+    parser.add_argument(
+        "--is-pretrained-context-encoder",
+        type=str2bool,
+        default=False,
+        help="""Embed the biasing words with pretrained word embeddings (see
+        --pretrained-word-encoder) instead of an LSTM over their BPE tokens.""",
+    )
+
+    parser.add_argument(
+        "--pretrained-word-encoder",
+        type=str,
+        default="fasttext",
+        choices=["fasttext", "bert"],
+        help="Pretrained word embeddings for --is-pretrained-context-encoder.",
+    )
+
+    parser.add_argument(
+        "--fasttext-embeddings",
+        type=str,
+        default=None,
+        help="""For --pretrained-word-encoder fasttext: a text file with one
+        "word v1 ... v300" line per word.""",
+    )
+
+    parser.add_argument(
+        "--fasttext-model",
+        type=str,
+        default=None,
+        help="""For --pretrained-word-encoder fasttext: the fastText binary
+        model (e.g., cc.en.300.bin), used for words missing from
+        --fasttext-embeddings.""",
+    )
+
+    parser.add_argument(
+        "--is-reused-context-encoder",
+        type=str2bool,
+        default=False,
+        help="""Embed the biasing words by running the (frozen) transducer
+        decoder over their BPE tokens, followed by an LSTM.""",
+    )
+
     parser.add_argument(
         "--context-dim",
         type=int,
@@ -250,7 +286,7 @@ def get_parser():
     parser.add_argument(
         "--exp-dir",
         type=str,
-        default="pruned_transducer_stateless7/exp",
+        default="pruned_transducer_stateless7_contextual/exp",
         help="""The experiment dir.
         It specifies the directory where all training related
         files, e.g., checkpoints, log, etc, are saved
@@ -414,42 +450,28 @@ def get_parser():
         "--context-dir",
         type=str,
         default="data/fbai-speech/is21_deep_bias/",
-        help="",
+        help="Path to fbai-speech/is21_deep_bias (words/ and ref/ biasing lists).",
     )
 
     parser.add_argument(
         "--n-distractors",
         type=int,
         default=100,
-        help="",
+        help="Number of distractor words added to the biasing list of each training utterance; -1 for a random number in [10, 500).",
     )
 
     parser.add_argument(
         "--keep-ratio",
         type=float,
         default=1.0,
-        help="",
+        help="Each rare word of a training utterance is kept in its biasing list with this probability, to simulate incomplete biasing lists.",
     )
 
     parser.add_argument(
         "--is-full-context",
         type=str2bool,
         default=False,
-        help="",
-    )
-
-    parser.add_argument(
-        "--is-pretrained-context-encoder",
-        type=str2bool,
-        default=False,
-        help="",
-    )
-
-    parser.add_argument(
-        "--is-reused-context-encoder",
-        type=str2bool,
-        default=False,
-        help="",
+        help="If true, the biasing list of a training utterance contains all its words, not only the rare ones (words outside the 5k common words).",
     )
 
     add_model_arguments(parser)
@@ -568,16 +590,35 @@ def get_joiner_model(params: AttributeDict) -> nn.Module:
     )
     return joiner
 
+
+def get_word_encoder(params: AttributeDict, device: torch.device):
+    """Pretrained word embeddings for --is-pretrained-context-encoder.
+    It also sets params.context_embedding_size."""
+    if params.pretrained_word_encoder == "bert":
+        from word_encoder_bert import BertEncoder
+
+        word_encoder = BertEncoder(device=device)
+    else:
+        from word_encoder_fasttext import FastTextEncoder
+
+        assert (
+            params.fasttext_embeddings and params.fasttext_model
+        ), "Please provide --fasttext-embeddings and --fasttext-model"
+        word_encoder = FastTextEncoder(
+            embeddings_path=params.fasttext_embeddings,
+            model_path=params.fasttext_model,
+        )
+    params.context_embedding_size = word_encoder.embedding_size
+    return word_encoder
+
+
 def get_contextual_model(params: AttributeDict, decoder=None) -> nn.Module:
     context_dim = params.context_dim
 
     if params.is_pretrained_context_encoder:
         context_encoder = ContextEncoderPretrained(
-            # context_encoder_dim=int(params.encoder_dims.split(",")[-1]),
-            # output_dim=params.joiner_dim,
             context_encoder_dim=params.context_embedding_size,
             output_dim=context_dim,
-            drop_out=0.1,
         )
     elif params.is_reused_context_encoder:
         assert decoder is not None
@@ -587,18 +628,14 @@ def get_contextual_model(params: AttributeDict, decoder=None) -> nn.Module:
             output_dim=context_dim,
             num_lstm_layers=1,
             num_lstm_directions=2,
-            drop_out=0.1,
         )
-    else:        
+    else:
         context_encoder = ContextEncoderLSTM(
             vocab_size=params.vocab_size,
-            # context_encoder_dim=int(params.encoder_dims.split(",")[-1]),
-            # output_dim=params.joiner_dim,
             context_encoder_dim=context_dim,
             output_dim=context_dim,
             num_layers=2,
             num_directions=2,
-            drop_out=0.0,
         )
 
     encoder_biasing_adapter = BiasingModule(
@@ -615,11 +652,16 @@ def get_contextual_model(params: AttributeDict, decoder=None) -> nn.Module:
 
     return context_encoder, encoder_biasing_adapter, decoder_biasing_adapter
 
+
 def get_transducer_model(params: AttributeDict) -> nn.Module:
     encoder = get_encoder_model(params)
     decoder = get_decoder_model(params)
     joiner = get_joiner_model(params)
-    context_encoder, encoder_biasing_adapter, decoder_biasing_adapter = get_contextual_model(params, decoder=decoder)
+    (
+        context_encoder,
+        encoder_biasing_adapter,
+        decoder_biasing_adapter,
+    ) = get_contextual_model(params, decoder=decoder)
 
     model = Transducer(
         encoder=encoder,
@@ -629,8 +671,8 @@ def get_transducer_model(params: AttributeDict) -> nn.Module:
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
         vocab_size=params.vocab_size,
-        context_encoder=context_encoder, 
-        encoder_biasing_adapter=encoder_biasing_adapter, 
+        context_encoder=context_encoder,
+        encoder_biasing_adapter=encoder_biasing_adapter,
         decoder_biasing_adapter=decoder_biasing_adapter,
     )
     return model
@@ -712,10 +754,16 @@ def load_pretrained_asr(filename: str, model: nn.Module) -> None:
     logging.info(f"Loading pretrained ASR model from {filename}")
     checkpoint = torch.load(filename, map_location="cpu", weights_only=False)
     missing, unexpected = model.load_state_dict(checkpoint["model"], strict=False)
-    biasing_modules = ("context_encoder.", "encoder_biasing_adapter.", "decoder_biasing_adapter.")
+    biasing_modules = (
+        "context_encoder.",
+        "encoder_biasing_adapter.",
+        "decoder_biasing_adapter.",
+    )
     unexpected_missing = [k for k in missing if not k.startswith(biasing_modules)]
     assert not unexpected and not unexpected_missing, (unexpected, unexpected_missing)
-    logging.info(f"Initialized ASR model; {len(missing)} biasing tensors are randomly initialized")
+    logging.info(
+        f"Initialized ASR model; {len(missing)} biasing tensors are randomly initialized"
+    )
 
 
 def save_checkpoint(
@@ -810,8 +858,6 @@ def compute_loss(
     # at entry, feature is (N, T, C)
     assert feature.ndim == 3
     feature = feature.to(device)
-    # print(feature)
-    # breakpoint()
 
     supervisions = batch["supervisions"]
     feature_lens = supervisions["num_frames"].to(device)
@@ -823,20 +869,21 @@ def compute_loss(
     y = sp.encode(texts, out_type=int)
     y = k2.RaggedTensor(y).to(device)
 
-    word_list, word_lengths, num_words_per_utt = \
-        context_collector.get_context_word_list(batch)
+    (
+        word_list,
+        word_lengths,
+        num_words_per_utt,
+    ) = context_collector.get_context_word_list(batch)
     word_list = word_list.to(device)
-    # word_lengths = word_lengths.to(device)
-    # num_words_per_utt = num_words_per_utt.to(device)
     contexts = {
         "mode": "get_context_word_list",
-        "word_list": word_list, 
-        "word_lengths": word_lengths, 
+        "word_list": word_list,
+        "word_lengths": word_lengths,
         "num_words_per_utt": num_words_per_utt,
     }
 
     with torch.cuda.amp.autocast(enabled=params.use_fp16):
-        with torch.set_grad_enabled(is_training):            
+        with torch.set_grad_enabled(is_training):
 
             simple_loss, pruned_loss = model(
                 x=feature,
@@ -1153,43 +1200,30 @@ def run(rank, world_size, args):
 
     logging.info("About to load context generator")
     params.context_dir = Path(params.context_dir)
+    word_encoder = None
     if params.is_pretrained_context_encoder:
-        from word_encoder_fasttext import FastTextEncoder
-
-        word_encoder = FastTextEncoder(
-            embeddings_path="pruned_transducer_stateless7_context/exp/exp_fasttext/fasttext_all_words.embeddings.txt", 
-            model_path="pruned_transducer_stateless7_context/exp/exp_fasttext/cc.en.300.bin",
-        )
-        context_collector = ContextCollector(
-            path_is21_deep_bias=params.context_dir,
-            sp=None,
-            bert_encoder=word_encoder,
-            is_predefined=False,
-            n_distractors=params.n_distractors,
-            keep_ratio=params.keep_ratio,
-            is_full_context=params.is_full_context,
-        )
-        params.context_embedding_size = word_encoder.embedding_size
-    else:
-        bert_encoder=None
-        context_collector = ContextCollector(
-            path_is21_deep_bias=params.context_dir,
-            sp=sp,
-            bert_encoder=None,
-            is_predefined=False,
-            n_distractors=params.n_distractors,
-            keep_ratio=params.keep_ratio,
-            is_full_context=params.is_full_context,
-        )
+        word_encoder = get_word_encoder(params, device)
+    context_collector = ContextCollector(
+        path_is21_deep_bias=params.context_dir,
+        sp=None if word_encoder is not None else sp,
+        bert_encoder=word_encoder,
+        is_predefined=False,
+        n_distractors=params.n_distractors,
+        keep_ratio=params.keep_ratio,
+        is_full_context=params.is_full_context,
+    )
 
     logging.info("About to create model")
     model = get_transducer_model(params)
-    # print(model)
 
     model.params = params
     model.asr_eval_mode = params.asr_eval_mode
 
-    if params.init_asr_ckpt is not None and params.start_epoch == 1 and params.start_batch == 0:
+    if (
+        params.init_asr_ckpt is not None
+        and params.start_epoch == 1
+        and params.start_batch == 0
+    ):
         load_pretrained_asr(params.init_asr_ckpt, model)
 
     # Freeze the parameters of the ASR model
@@ -1205,7 +1239,7 @@ def run(rank, world_size, args):
     # compute the number of free params vs. frozen params
     num_param = sum([p.numel() for p in model.parameters()])
     logging.info(f"Number of model parameters: {num_param}")
-    
+
     num_param_requires_grad = sum(
         [p.numel() for p in model.parameters() if p.requires_grad]
     )
@@ -1214,10 +1248,6 @@ def run(rank, world_size, args):
         f"{num_param_requires_grad} "
         f"({num_param_requires_grad/num_param*100:.2f}%)"
     )
-
-    # for n, p in model.named_parameters():
-    #     if p.requires_grad:
-    #         print(f"require grad [{n}]: {p.numel()}")
 
     assert params.save_every_n >= params.average_period
     model_avg: Optional[nn.Module] = None
@@ -1269,23 +1299,13 @@ def run(rank, world_size, args):
     if params.inf_check:
         register_inf_check_hooks(model)
 
-    # TODO: double check
-    num_param_requires_grad = sum(
-        [p.numel() for p in model.parameters() if p.requires_grad]
-    )
-    logging.info(
-        f"Number of model parameters (requires_grad, double check): "
-        f"{num_param_requires_grad} "
-        f"({num_param_requires_grad/num_param*100:.2f}%)"
-    )
-
     librispeech = LibriSpeechAsrDataModule(args)
 
     if params.full_libri:
         train_cuts = librispeech.train_all_shuf_cuts()
     else:
         train_cuts = librispeech.train_clean_100_cuts()
-    
+
     if rank == 0:
         train_cuts.describe()
 
@@ -1326,7 +1346,6 @@ def run(rank, world_size, args):
 
         return True
 
-    # train_cuts = train_cuts.to_eager()
     train_cuts = train_cuts.filter(remove_short_and_long_utt)
 
     if params.start_batch > 0 and checkpoints and "sampler" in checkpoints:
@@ -1344,40 +1363,36 @@ def run(rank, world_size, args):
     valid_cuts += librispeech.dev_other_cuts()
     valid_dl = librispeech.valid_dataloaders(valid_cuts)
 
-    # if not params.print_diagnostics:
-    #     scan_pessimistic_batches_for_oom(
-    #         model=model,
-    #         context_collector=context_collector,
-    #         train_dl=train_dl,
-    #         optimizer=optimizer,
-    #         sp=sp,
-    #         params=params,
-    #     )
+    if not params.print_diagnostics:
+        scan_pessimistic_batches_for_oom(
+            model=model,
+            context_collector=context_collector,
+            train_dl=train_dl,
+            optimizer=optimizer,
+            sp=sp,
+            params=params,
+        )
 
     scaler = GradScaler(enabled=params.use_fp16, init_scale=1.0)
     if checkpoints and "grad_scaler" in checkpoints:
         logging.info("Loading grad scaler state dict")
         scaler.load_state_dict(checkpoints["grad_scaler"])
 
-    # Add new words to context_collector, and free up the BERT model from GPU
-    if params.is_pretrained_context_encoder:
+    # Embed the words of the train/dev cuts that are not in the word lists
+    # once, then free up the word encoder
+    if word_encoder is not None:
         new_words = set()
         logging.info("Looking for new words in train+dev cuts...")
-        total_cuts = 0
-        for cut_idx, cut in enumerate(itertools.chain(train_cuts, valid_cuts)):
-            total_cuts += 1
-            # if cut_idx % 10000 == 0:
-            #     logging.info(f"cut_idx: {cut_idx}")
-            text = cut.supervisions[0].text
-            for word in text.split():
-                if word not in context_collector.common_words or \
-                    word not in context_collector.rare_words:
-                        new_words.add(word)
+        for cut in itertools.chain(train_cuts, valid_cuts):
+            for word in cut.supervisions[0].text.split():
+                if (
+                    word not in context_collector.common_words
+                    and word not in context_collector.rare_words
+                ):
+                    new_words.add(word)
         logging.info(f"{len(new_words)} new words detected.")
-        logging.info(f"Total cuts: {total_cuts}")
-        context_collector.add_new_words(list(new_words))
-        if word_encoder is not None:
-            word_encoder.free_up()
+        context_collector.add_new_words(sorted(new_words))
+        word_encoder.free_up()
 
     for epoch in range(params.start_epoch, params.num_epochs + 1):
         scheduler.step_epoch(epoch - 1)

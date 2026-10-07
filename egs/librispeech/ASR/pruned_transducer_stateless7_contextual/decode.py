@@ -18,115 +18,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
+Decode test-clean/test-other with the predefined biasing lists of
+https://github.com/facebookresearch/fbai-speech/tree/main/is21_deep_bias
+and report WER, U-WER (unbiased words) and B-WER (biased words).
+See ./README.md for more details.
+
 Usage:
-(1) greedy search
-./pruned_transducer_stateless7/decode.py \
-    --epoch 28 \
-    --avg 15 \
-    --exp-dir ./pruned_transducer_stateless7/exp \
-    --max-duration 600 \
-    --decoding-method greedy_search
 
-(2) beam search (not recommended)
-./pruned_transducer_stateless7/decode.py \
-    --epoch 28 \
-    --avg 15 \
-    --exp-dir ./pruned_transducer_stateless7/exp \
-    --max-duration 600 \
-    --decoding-method beam_search \
-    --beam-size 4
+./pruned_transducer_stateless7_contextual/decode.py \
+  --epoch 30 \
+  --avg 9 \
+  --exp-dir pruned_transducer_stateless7_contextual/exp \
+  --bpe-model data/lang_bpe_500/bpe.model \
+  --context-dir data/fbai-speech/is21_deep_bias \
+  --is-predefined true \
+  --n-distractors 100 \
+  --decoding-method modified_beam_search \
+  --beam-size 4 \
+  --max-duration 600
 
-(3) modified beam search
-./pruned_transducer_stateless7/decode.py \
-    --epoch 28 \
-    --avg 15 \
-    --exp-dir ./pruned_transducer_stateless7/exp \
-    --max-duration 600 \
-    --decoding-method modified_beam_search \
-    --beam-size 4
-
-(4) fast beam search (one best)
-./pruned_transducer_stateless7/decode.py \
-    --epoch 28 \
-    --avg 15 \
-    --exp-dir ./pruned_transducer_stateless7/exp \
-    --max-duration 600 \
-    --decoding-method fast_beam_search \
-    --beam 20.0 \
-    --max-contexts 8 \
-    --max-states 64
-
-(5) fast beam search (nbest)
-./pruned_transducer_stateless7/decode.py \
-    --epoch 28 \
-    --avg 15 \
-    --exp-dir ./pruned_transducer_stateless7/exp \
-    --max-duration 600 \
-    --decoding-method fast_beam_search_nbest \
-    --beam 20.0 \
-    --max-contexts 8 \
-    --max-states 64 \
-    --num-paths 200 \
-    --nbest-scale 0.5
-
-(6) fast beam search (nbest oracle WER)
-./pruned_transducer_stateless7/decode.py \
-    --epoch 28 \
-    --avg 15 \
-    --exp-dir ./pruned_transducer_stateless7/exp \
-    --max-duration 600 \
-    --decoding-method fast_beam_search_nbest_oracle \
-    --beam 20.0 \
-    --max-contexts 8 \
-    --max-states 64 \
-    --num-paths 200 \
-    --nbest-scale 0.5
-
-(7) fast beam search (with LG)
-./pruned_transducer_stateless7/decode.py \
-    --epoch 28 \
-    --avg 15 \
-    --exp-dir ./pruned_transducer_stateless7/exp \
-    --max-duration 600 \
-    --decoding-method fast_beam_search_nbest_LG \
-    --beam 20.0 \
-    --max-contexts 8 \
-    --max-states 64
-
-(8) modified beam search with RNNLM shallow fusion
-./pruned_transducer_stateless5/decode.py \
-    --epoch 35 \
-    --avg 15 \
-    --exp-dir ./pruned_transducer_stateless5/exp \
-    --max-duration 600 \
-    --decoding-method modified_beam_search_lm_shallow_fusion \
-    --beam-size 4 \
-    --lm-type rnn \
-    --lm-scale 0.3 \
-    --lm-exp-dir /path/to/LM \
-    --rnn-lm-epoch 99 \
-    --rnn-lm-avg 1 \
-    --rnn-lm-num-layers 3 \
-    --rnn-lm-tie-weights 1
-
-(9) modified beam search with LM shallow fusion + LODR
-./pruned_transducer_stateless5/decode.py \
-    --epoch 28 \
-    --avg 15 \
-    --max-duration 600 \
-    --exp-dir ./pruned_transducer_stateless5/exp \
-    --decoding-method modified_beam_search_LODR \
-    --beam-size 4 \
-    --lm-type rnn \
-    --lm-scale 0.4 \
-    --lm-exp-dir /path/to/LM \
-    --rnn-lm-epoch 99 \
-    --rnn-lm-avg 1 \
-    --rnn-lm-num-layers 3 \
-    --rnn-lm-tie-weights 1
-    --tokens-ngram 2 \
-    --ngram-lm-scale -0.16 \
-
+Neural biasing of the encoder and of the decoder output can be disabled
+with --no-encoder-biasing true and --no-decoder-biasing true. Decoder
+biasing and WFST biasing (--no-wfst-lm-biasing false --biased-lm-scale X)
+are only implemented in modified_beam_search and modified_beam_search_LODR.
 """
 
 
@@ -153,15 +67,16 @@ from beam_search import (
     modified_beam_search,
     modified_beam_search_lm_shallow_fusion,
     modified_beam_search_LODR,
-    modified_beam_search_ngram_rescoring,
 )
-from train import add_model_arguments, get_params, get_transducer_model
-from context_collector import ContextCollector
-from context_encoder import ContextEncoder
-from context_encoder_lstm import ContextEncoderLSTM
-from context_encoder_pretrained import ContextEncoderPretrained
-
 from biased_lm import BiasedNgramLm
+from context_collector import ContextCollector
+from train import (
+    add_model_arguments,
+    get_params,
+    get_transducer_model,
+    get_word_encoder,
+)
+
 from icefall import LmScorer, NgramLm
 from icefall.checkpoint import (
     average_checkpoints,
@@ -228,7 +143,7 @@ def get_parser():
     parser.add_argument(
         "--exp-dir",
         type=str,
-        default="pruned_transducer_stateless7/exp",
+        default="pruned_transducer_stateless7_contextual/exp",
         help="The experiment dir",
     )
 
@@ -249,7 +164,7 @@ def get_parser():
     parser.add_argument(
         "--decoding-method",
         type=str,
-        default="greedy_search",
+        default="modified_beam_search",
         help="""Possible values are:
           - greedy_search
           - beam_search
@@ -420,52 +335,49 @@ def get_parser():
         "--context-dir",
         type=str,
         default="data/fbai-speech/is21_deep_bias/",
-        help="",
+        help="Path to fbai-speech/is21_deep_bias (words/ and ref/ biasing lists).",
     )
 
     parser.add_argument(
         "--n-distractors",
         type=int,
         default=100,
-        help="",
+        help="With --is-predefined true: size N of the predefined biasing lists ref/test-*.biasing_N.tsv (100, 500, 1000 or 2000). Otherwise: number of random distractors added to the rare words of each utterance.",
     )
 
     parser.add_argument(
         "--keep-ratio",
         type=float,
         default=1.0,
-        help="",
+        help="Without --is-predefined: each rare word of an utterance is kept in its biasing list with this probability.",
     )
 
     parser.add_argument(
         "--no-encoder-biasing",
         type=str2bool,
         default=False,
-        help=""".
-        """,
+        help="Disable the neural biasing of the encoder output.",
     )
 
     parser.add_argument(
         "--no-decoder-biasing",
         type=str2bool,
         default=False,
-        help=""".
-        """,
+        help="Disable the neural biasing of the decoder output (only implemented in modified_beam_search and modified_beam_search_LODR).",
     )
 
     parser.add_argument(
         "--no-wfst-lm-biasing",
         type=str2bool,
         default=True,
-        help=""".
-        """,
+        help="Disable shallow fusion with a WFST built from the biasing list (only implemented in modified_beam_search and modified_beam_search_LODR); see --biased-lm-scale.",
     )
 
     parser.add_argument(
         "--is-full-context",
         type=str2bool,
         default=False,
-        help="",
+        help="Without --is-predefined: use all words of an utterance, not only the rare ones.",
     )
 
     parser.add_argument(
@@ -479,28 +391,14 @@ def get_parser():
         "--is-predefined",
         type=str2bool,
         default=False,
-        help="",
-    )
-
-    parser.add_argument(
-        "--is-pretrained-context-encoder",
-        type=str2bool,
-        default=False,
-        help="",
+        help="Use the predefined biasing lists of test-clean/test-other from --context-dir (as in the paper). Otherwise biasing lists are built from the reference transcripts as in training.",
     )
 
     parser.add_argument(
         "--biased-lm-scale",
         type=float,
         default=0.0,
-        help="",
-    )
-
-    parser.add_argument(
-        "--is-reused-context-encoder",
-        type=str2bool,
-        default=False,
-        help="",
+        help="Scale of the bonus from the biasing WFST; with the default 0, WFST biasing has no effect even with --no-wfst-lm-biasing false.",
     )
 
     add_model_arguments(parser)
@@ -601,34 +499,38 @@ def decode_one_batch(
     model.scratch_space["sp"] = sp
     model.scratch_space["biased_lm_scale"] = params.biased_lm_scale
 
-    if not params.no_wfst_lm_biasing:
-        fsa_list, fsa_sizes, num_words_per_utt2 = \
-            context_collector.get_context_word_wfst(batch)
-        biased_lm_list = [
-            BiasedNgramLm(
-                fst=fsa, 
-                backoff_id=context_collector.backoff_id
-            ) for fsa in fsa_list
-        ]
-        model.scratch_space["biased_lm_list"] = biased_lm_list
+    # The same biasing lists for the WFST and the neural biasing
+    word_lists = context_collector.get_word_lists(batch)
 
-    if not model.no_encoder_biasing:
-        word_list, word_lengths, num_words_per_utt = \
-            context_collector.get_context_word_list(batch)
-        word_list = word_list.to(device)
+    if not model.no_wfst_lm_biasing:
+        fsa_list, _, _ = context_collector.get_context_word_wfst(batch, word_lists)
+        model.scratch_space["biased_lm_list"] = [
+            BiasedNgramLm(fst=fsa, backoff_id=context_collector.backoff_id)
+            for fsa in fsa_list
+        ]
+
+    if not (model.no_encoder_biasing and model.no_decoder_biasing):
+        # The context embeddings are used by both the encoder and the
+        # decoder (in beam_search.py) biasing modules
+        (
+            word_list,
+            word_lengths,
+            num_words_per_utt,
+        ) = context_collector.get_context_word_list(batch, word_lists)
         contexts = {
             "mode": "get_context_word_list",
-            "word_list": word_list, 
-            "word_lengths": word_lengths, 
+            "word_list": word_list.to(device),
+            "word_lengths": word_lengths,
             "num_words_per_utt": num_words_per_utt,
         }
-        contexts_h, contexts_mask = model.context_encoder.embed_contexts(
-            contexts,
-        )
+        contexts_h, contexts_mask = model.context_encoder.embed_contexts(contexts)
         model.scratch_space["contexts_h"] = contexts_h
         model.scratch_space["contexts_mask"] = contexts_mask
 
-        encoder_biasing_out, attn = model.encoder_biasing_adapter.forward(encoder_out, contexts_h, contexts_mask)
+    if not model.no_encoder_biasing:
+        encoder_biasing_out, _ = model.encoder_biasing_adapter(
+            encoder_out, contexts_h, contexts_mask
+        )
         encoder_out = encoder_out + encoder_biasing_out
 
     hyps = []
@@ -697,24 +599,12 @@ def decode_one_batch(
         for hyp in sp.decode(hyp_tokens):
             hyps.append(hyp.split())
     elif params.decoding_method == "modified_beam_search":
-        # hyp_tokens = modified_beam_search(
-        #     model=model,
-        #     encoder_out=encoder_out,
-        #     encoder_out_lens=encoder_out_lens,
-        #     beam=params.beam_size,
-        # )
-        # for hyp in sp.decode(hyp_tokens):
-        #     hyps.append(hyp.split())
-        
-        results = modified_beam_search(
+        hyp_tokens = modified_beam_search(
             model=model,
             encoder_out=encoder_out,
             encoder_out_lens=encoder_out_lens,
             beam=params.beam_size,
-            return_timestamps=True,
         )
-        hyp_tokens = results.hyps
-        timestamps = results.timestamps
         for hyp in sp.decode(hyp_tokens):
             hyps.append(hyp.split())
     elif params.decoding_method == "modified_beam_search_lm_shallow_fusion":
@@ -832,18 +722,10 @@ def decode_dataset(
     else:
         log_interval = 20
 
-    device = next(model.parameters()).device
-
     results = defaultdict(list)
     for batch_idx, batch in enumerate(dl):
         texts = batch["supervisions"]["text"]
         cut_ids = [cut.id for cut in batch["supervisions"]["cut"]]
-        # if "1998-29455-0019-602" in cut_ids:
-        #     logging.info(cut_ids)
-        #     logging.info(cut_ids.index("1998-29455-0019-602"))
-        #     # import pdb; pdb.set_trace()
-        # else:
-        #     continue
 
         hyps_dict = decode_one_batch(
             params=params,
@@ -913,6 +795,7 @@ def save_results(
         note = ""
     logging.info(s)
 
+
 def rare_word_score(
     params: AttributeDict,
     test_set_name: str,
@@ -920,17 +803,21 @@ def rare_word_score(
     cuts,
 ):
     from collections import namedtuple
-    from score import main as score_main
+
     from lhotse import CutSet
+    from score import main as score_main
 
     logging.info(f"test_set_name: {test_set_name}")
     cuts = cuts[0]
     cuts = [c for c in cuts]
     cuts = CutSet.from_cuts(cuts)
 
-    args = namedtuple('A', ['refs', 'hyps', 'lenient'])
+    args = namedtuple("A", ["refs", "hyps", "lenient"])
     if params.n_distractors > 0:
-        args.refs = params.context_dir / f"ref/{test_set_name}.biasing_{params.n_distractors}.tsv"
+        args.refs = (
+            params.context_dir
+            / f"ref/{test_set_name}.biasing_{params.n_distractors}.tsv"
+        )
     else:
         args.refs = params.context_dir / f"ref/{test_set_name}.biasing_100.tsv"
     args.lenient = True
@@ -945,9 +832,10 @@ def rare_word_score(
             hyp = " ".join(hyp)
             hyp = hyp.lower()
             args.hyps[u_id] = hyp
-        
+
         score_main(args)
         print()
+
 
 @torch.no_grad()
 def main():
@@ -1012,18 +900,16 @@ def main():
     if not params.no_wfst_lm_biasing:
         params.suffix += f"-wfst-biasing-{params.biased_lm_scale}"
     if not params.no_encoder_biasing:
-        params.suffix += f"-encoder-biasing"
+        params.suffix += "-encoder-biasing"
     if not params.no_decoder_biasing:
-        params.suffix += f"-decoder-biasing"
+        params.suffix += "-decoder-biasing"
+    if params.is_predefined:
+        params.suffix += f"-biasing-list-{params.n_distractors}"
+    else:
+        params.suffix += f"-distractors-{params.n_distractors}"
 
     if params.use_averaged_model:
         params.suffix += "-use-averaged-model"
-    
-    # import time
-    # timestr = time.strftime("%Y%m%d-%H%M%S")
-    from datetime import datetime
-    timestr = datetime.utcnow().strftime('%Y%m%d-%H%M%S-%f')[:-3]
-    params.suffix += f"-{timestr}"
 
     setup_logger(f"{params.res_dir}/log-decode-{params.suffix}")
     logging.info("Decoding started")
@@ -1051,33 +937,19 @@ def main():
 
     logging.info("About to load context collector")
     params.context_dir = Path(params.context_dir)
+    word_encoder = None
     if params.is_pretrained_context_encoder:
-        # Use pretrained encoder, e.g., BERT
-        from word_encoder_bert import BertEncoder
-
-        bert_encoder = BertEncoder(device=device)
-        context_collector = ContextCollector(
-            path_is21_deep_bias=params.context_dir,
-            sp=None,
-            bert_encoder=bert_encoder,
-            is_predefined=params.is_predefined,
-            n_distractors=params.n_distractors,
-            keep_ratio=params.keep_ratio,
-            is_full_context=params.is_full_context,
-            backoff_id=params.backoff_id,
-        )
-        # bert_encoder.free_up()
-    else:
-        context_collector = ContextCollector(
-            path_is21_deep_bias=params.context_dir,
-            sp=sp,
-            bert_encoder=None,
-            is_predefined=params.is_predefined,
-            n_distractors=params.n_distractors,
-            keep_ratio=params.keep_ratio,
-            is_full_context=params.is_full_context,
-            backoff_id=params.backoff_id,
-        )
+        word_encoder = get_word_encoder(params, device)
+    context_collector = ContextCollector(
+        path_is21_deep_bias=params.context_dir,
+        sp=None if word_encoder is not None else sp,
+        bert_encoder=word_encoder,
+        is_predefined=params.is_predefined,
+        n_distractors=params.n_distractors,
+        keep_ratio=params.keep_ratio,
+        is_full_context=params.is_full_context,
+        backoff_id=params.backoff_id,
+    )
 
     logging.info("About to create model")
     model = get_transducer_model(params)

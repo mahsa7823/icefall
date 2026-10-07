@@ -40,18 +40,19 @@ from context_collector import ContextCollector
 from decode import decode_one_batch
 from decode import get_params as get_decode_params
 from decode import get_parser as get_decode_parser
-from icefall.checkpoint import average_checkpoints_with_averaged_model
-from icefall.checkpoint import save_checkpoint as save_checkpoint_impl
 from score import main as score_main
 from train import (
     compute_loss,
     get_params,
     get_parser,
     get_transducer_model,
+    get_word_encoder,
     load_pretrained_asr,
 )
 
-# A tiny Zipformer so that the test runs in seconds on CPU
+from icefall.checkpoint import average_checkpoints_with_averaged_model
+from icefall.checkpoint import save_checkpoint as save_checkpoint_impl
+
 TINY_MODEL_ARGS = [
     "--num-encoder-layers", "1,1,1,1,1",
     "--feedforward-dims", "64,64,64,64,64",
@@ -154,15 +155,23 @@ def test_train_step(params, sp, context_collector, model, batch):
     assert torch.isfinite(loss), info
 
     biasing = ("context_encoder", "encoder_biasing_adapter", "decoder_biasing_adapter")
-    with_grad = {n.split(".")[0] for n, p in model.named_parameters() if p.grad is not None}
+    with_grad = {
+        n.split(".")[0] for n, p in model.named_parameters() if p.grad is not None
+    }
     assert with_grad == set(biasing), with_grad
     print(f"train step OK: {info}")
 
 
 def test_init_asr_ckpt(params, model, d: Path):
     """--init-asr-ckpt: load a checkpoint that has no biasing modules."""
-    biasing = ("context_encoder.", "encoder_biasing_adapter.", "decoder_biasing_adapter.")
-    asr_state = {k: v for k, v in model.state_dict().items() if not k.startswith(biasing)}
+    biasing = (
+        "context_encoder.",
+        "encoder_biasing_adapter.",
+        "decoder_biasing_adapter.",
+    )
+    asr_state = {
+        k: v for k, v in model.state_dict().items() if not k.startswith(biasing)
+    }
     torch.save({"model": asr_state}, d / "asr.pt")
 
     new_model = get_transducer_model(params)
@@ -199,7 +208,9 @@ def test_predefined_lists_and_scoring(sp, common, rare, d: Path):
         "1-1-0001": " ".join(utts["1-1-0001"][0]).lower(),
         "1-1-0002": common[1].lower(),
     }
-    args = SimpleNamespace(refs=d / "ctx/ref/test-clean.biasing_100.tsv", hyps=hyps, lenient=True)
+    args = SimpleNamespace(
+        refs=d / "ctx/ref/test-clean.biasing_100.tsv", hyps=hyps, lenient=True
+    )
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         score_main(args)
@@ -216,10 +227,15 @@ def test_average_checkpoints(params, model, d: Path):
     for epoch in (1, 2):
         params.batch_idx_train = 200 * epoch
         save_checkpoint_impl(
-            filename=d / f"epoch-{epoch}.pt", model=model, model_avg=model, params=params
+            filename=d / f"epoch-{epoch}.pt",
+            model=model,
+            model_avg=model,
+            params=params,
         )
     avg = average_checkpoints_with_averaged_model(
-        filename_start=str(d / "epoch-1.pt"), filename_end=str(d / "epoch-2.pt"), device="cpu"
+        filename_start=str(d / "epoch-1.pt"),
+        filename_end=str(d / "epoch-2.pt"),
+        device="cpu",
     )
     assert avg.keys() == model.state_dict().keys()
     print("checkpoint averaging OK")
@@ -249,6 +265,50 @@ def test_asr_eval_mode_and_context_dim(params):
     print("asr-eval-mode and context-dim OK")
 
 
+def test_pretrained_word_encoder(params, common, rare, batch, d: Path):
+    """--is-pretrained-context-encoder with fastText-style embeddings:
+    the same word encoder must be used for training and decoding."""
+    with open(d / "embeddings.txt", "w") as f:
+        for w in common + rare:
+            print(w.lower(), *[f"{x:.3f}" for x in torch.randn(300).tolist()], file=f)
+
+    params = type(params)(dict(params))
+    params.is_pretrained_context_encoder = True
+    params.pretrained_word_encoder = "fasttext"
+    params.fasttext_embeddings = str(d / "embeddings.txt")
+    params.fasttext_model = str(d / "not-needed.bin")  # all words are in the file
+    word_encoder = get_word_encoder(params, torch.device("cpu"))
+    assert params.context_embedding_size == 300
+
+    collector = ContextCollector(
+        path_is21_deep_bias=Path(params.context_dir),
+        sp=None,
+        bert_encoder=word_encoder,
+        n_distractors=params.n_distractors,
+        backoff_id=params.backoff_id,
+    )
+    model = get_transducer_model(params)
+    model.params = params
+    sp = spm.SentencePieceProcessor()
+    sp.load(params.bpe_model)
+
+    model.train()
+    loss, _ = compute_loss(params, model, collector, sp, batch, is_training=True)
+    loss.backward()
+    assert torch.isfinite(loss)
+
+    model.eval()
+    params.decoding_method = "modified_beam_search"
+    params.beam_size = 2
+    model.no_encoder_biasing = params.no_encoder_biasing = False
+    model.no_decoder_biasing = params.no_decoder_biasing = False
+    model.no_wfst_lm_biasing = params.no_wfst_lm_biasing = True
+    with torch.no_grad():
+        hyps = decode_one_batch(params, model, collector, sp, batch)
+    assert len(next(iter(hyps.values()))) == 2
+    print("pretrained word encoder (fastText) train + decode OK")
+
+
 def test_decode(params, sp, context_collector, model, batch):
     model.eval()
     # (method, encoder biasing, decoder biasing, WFST biasing)
@@ -257,6 +317,7 @@ def test_decode(params, sp, context_collector, model, batch):
         ("greedy_search", False, False, False),
         ("modified_beam_search", True, True, False),
         ("modified_beam_search", True, True, True),
+        ("modified_beam_search", False, True, False),
         ("modified_beam_search", False, False, False),
     ]
     for method, enc, dec, wfst in configs:
@@ -291,6 +352,7 @@ def main():
         test_asr_eval_mode_and_context_dim(params)
         test_train_step(params, sp, context_collector, model, batch)
         test_average_checkpoints(params, model, Path(d))
+        test_pretrained_word_encoder(params, common, rare, batch, Path(d))
         test_decode(params, sp, context_collector, model, batch)
 
 
